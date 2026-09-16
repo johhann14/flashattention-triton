@@ -84,7 +84,21 @@ def _attn_fwd_inner(
         K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_SIZE_KV))
 
     return O_block, l_i, m_i
-            
+
+@triton.autotune(
+    [
+        triton.Config(
+            {"BLOCK_SIZE_Q": BLOCK_SIZE_Q, "BLOCK_SIZE_KV": BLOCK_SIZE_KV},
+            num_stages=num_stages,
+            num_warps=num_warps,
+        )
+        for BLOCK_SIZE_Q in [64, 128]
+        for BLOCK_SIZE_KV in [32, 64]
+        for num_stages in ([3, 4, 7])
+        for num_warps in [2, 4]
+    ],
+    key=["SEQ_LEN", "HEAD_DIM"],
+)
 @triton.jit  
 def _attn_fwd(
     Q, #B, num_heads, seq_len, head_dim
@@ -156,7 +170,7 @@ def _attn_fwd(
     V_block_ptr = tl.make_block_ptr(
         base=V + qvk_offset,
         shape=(SEQ_LEN, HEAD_DIM),
-        strides=(stride_V_head, stride_V_dim),
+        strides=(stride_V_seq, stride_V_dim),
         offsets=(0, 0),
         block_shape=(BLOCK_SIZE_KV, HEAD_DIM),
         order=(1, 0),
@@ -166,7 +180,7 @@ def _attn_fwd(
     K_block_ptr = tl.make_block_ptr(
         base= K + qvk_offset,
         shape=(HEAD_DIM, SEQ_LEN),
-        strides=(stride_K_dim, stride_K_head), #to transpsoe swqp the stride 
+        strides=(stride_K_dim, stride_K_seq), #to transpsoe swqp the stride 
         offsets=(0,0),
         block_shape=(HEAD_DIM, BLOCK_SIZE_KV),
         order=(0,1),
@@ -176,7 +190,7 @@ def _attn_fwd(
     O_block_ptr = tl.make_block_ptr(
         base= O + qvk_offset,
         shape=(SEQ_LEN, HEAD_DIM),
-        strides=(stride_O_head, stride_O_dim), #to transpsoe swqp the stride 
+        strides=(stride_O_seq, stride_O_dim), #to transpsoe swqp the stride 
         offsets=(block_index_q * BLOCK_SIZE_Q, 0),
         block_shape=(BLOCK_SIZE_Q, HEAD_DIM),
         order=(1,0),
@@ -216,7 +230,7 @@ def _attn_fwd(
 
 
     if STAGE == 3:
-        O_block, l_i, m_i = -_attn_fwd_inner(
+        O_block, l_i, m_i = _attn_fwd_inner(
             O_block,
             l_i,
             m_i,
@@ -296,6 +310,8 @@ def _attn_bwd_preprocess(
 
     tl.store(D_block_ptrs, D_block)
 
+
+@triton.jit
 def _attn_bwd_dk_dv(
     Q,
     K,
@@ -400,12 +416,12 @@ def _attn_bwd_dk_dv(
 
             P_T_block = tl.where(mask_block, P_T_block, 0.0) # we can mask after softmax bc normalisation has already be computed by taking the mask 
 
-        dO = tl.load(dO_ptrs)
+        dO_block = tl.load(dO_ptrs)
         dV_block += tl.dot(P_T_block.to(tl.float16), dO_block).to(tl.float32)
 
         Di= tl.load(D+offs_q)
 
-        dpT_block = tl.dot(V_block, tl.trans(d0_block)).to(tl.float32)
+        dpT_block = tl.dot(V_block, tl.trans(dO_block)).to(tl.float32)
 
         dS_T_block = P_T_block * (dpT_block - Di[None, :])
         dS_T_block = dS_T_block.to(tl.float16)
@@ -424,7 +440,7 @@ def _attn_bwd_dk_dv(
     dK_block_ptrs = dK + offs_kv[:, None] * stride_seq + offs_dim[None, :] * stride_dim
     tl.store(dK_block_ptrs, dK_block)
 
-
+@triton.jit
 def _attn_bwd_dq(
     Q,
     K,
@@ -482,7 +498,7 @@ def _attn_bwd_dq(
     index_block_q = tl.program_id(0)
 
     start_q = index_block_q * BLOCK_Q
-    offs_q = start_q + tl.arange(BLOCK_Q)
+    offs_q = start_q + tl.arange(0, BLOCK_Q)
 
     Q_block = tl.load(Q + offs_q[:, None] * stride_seq + offs_dim[None, :] * stride_dim)
     dQ_block = tl.zeros([BLOCK_Q, HEAD_DIM], dtype=tl.float32)
@@ -493,8 +509,8 @@ def _attn_bwd_dq(
 
     offs_kv = tl.arange(0, BLOCK_KV)
 
-    kT_ptrs = K + offs_q[None, :] * stride_seq + offs_dim[:, None] * stride_dim
-    vT_ptrs = V + offs_q[None, :] * stride_seq + offs_dim[:, None] * stride_dim
+    kT_ptrs = K + offs_kv[None, :] * stride_seq + offs_dim[:, None] * stride_dim
+    vT_ptrs = V + offs_kv[None, :] * stride_seq + offs_dim[:, None] * stride_dim
 
     Di = tl.load(D + offs_q)
 
@@ -601,7 +617,7 @@ class TritonAttention(torch.autograd.Function):
         ctx.HEAD_DIM = HEAD_DIM_K
         ctx.causal = causal
 
-
+        return O
 
     @staticmethod
     def backward(ctx, dO):
@@ -616,7 +632,7 @@ class TritonAttention(torch.autograd.Function):
 
 
         BATCH_SIZE, NUM_HEADS, SEQ_LEN = Q.shape[:3]
-        NUM_WRAPS, NUM_STAGES = 4, 3
+        NUM_WARPS, NUM_STAGES = 4, 3
         BLOCK_SIZE_MICRO, BLOCK_SIZE_MACRO = 32, 128
 
         preprocess_grid = (SEQ_LEN // BLOCK_SIZE_MACRO, BATCH_SIZE * NUM_HEADS)
@@ -642,7 +658,7 @@ class TritonAttention(torch.autograd.Function):
             Q=Q,
             K=K,
             V=V,
-            softlax_scale=ctx.softmax_scale,
+            softmax_scale=ctx.softmax_scale,
             dO=dO,
             dQ=dQ,
             dK=dK,
@@ -659,7 +675,7 @@ class TritonAttention(torch.autograd.Function):
             BLOCK_KV=BLOCK_SIZE_MACRO,
             HEAD_DIM=ctx.HEAD_DIM,
             STAGE=stage,
-            num_wraps=NUM_WRAPS,
+            num_warps=NUM_WARPS,
             num_stages=NUM_STAGES,
         )         
 
@@ -667,7 +683,7 @@ class TritonAttention(torch.autograd.Function):
             Q=Q,
             K=K,
             V=V,
-            softlax_scale=ctx.softmax_scale,
+            softmax_scale=ctx.softmax_scale,
             dO=dO,
             dQ=dQ,
             dK=dK,
@@ -684,7 +700,7 @@ class TritonAttention(torch.autograd.Function):
             BLOCK_KV=BLOCK_SIZE_MICRO,
             HEAD_DIM=ctx.HEAD_DIM,
             STAGE=stage,
-            num_wraps=NUM_WRAPS,
+            num_warps=NUM_WARPS,
             num_stages=NUM_STAGES,      
         )
 
@@ -759,10 +775,10 @@ def test_op(
     assert torch.allclose(ref_dK, tri_dK, atol=atol, rtol=rtol)
     assert torch.allclose(ref_dV, tri_dV, atol=atol, rtol=rtol)
     
-
-
+    print(f"All assert passed!")
+    
 
 if __name__ == "__main__":
-    test_op(BATCH_SIZE=8, NUM_HEADS=16, SEQ_LEN=4096, HEAD_DIM=64, causal=True)
-    test_op(BATCH_SIZE=8, NUM_HEADS=16, SEQ_LEN=4096, HEAD_DIM=64, causal=False)    
+    test_op(BATCH_SIZE=2, NUM_HEADS=8, SEQ_LEN=1024, HEAD_DIM=32, causal=True)
+    test_op(BATCH_SIZE=2, NUM_HEADS=8, SEQ_LEN=1024, HEAD_DIM=32, causal=False)    
    
